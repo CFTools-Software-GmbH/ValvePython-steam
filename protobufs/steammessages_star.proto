@@ -1,4 +1,19 @@
 syntax = "proto2";
+syntax = "proto2";
+syntax = "proto2";
+syntax = "proto2";
+syntax = "proto2";
+syntax = "proto2";
+syntax = "proto2";
+syntax = "proto2";
+syntax = "proto2";
+syntax = "proto2";
+syntax = "proto2";
+syntax = "proto2";
+syntax = "proto2";
+syntax = "proto2";
+syntax = "proto2";
+syntax = "proto2";
 import "steammessages_base.proto";
 import "steammessages_unified_base.proto";
 
