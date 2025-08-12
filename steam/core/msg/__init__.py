@@ -198,6 +198,7 @@ class MsgProto(object):
             if proto:
                 self.body = proto()
                 if self.payload:
+                    print(self.payload)
                     self.body.ParseFromString(self.payload)
                     self.payload = None
             else:

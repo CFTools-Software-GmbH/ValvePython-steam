@@ -16,7 +16,7 @@ from steam.steamid import SteamID
 from steam.enums import EResult, EUniverse
 from steam.enums.emsg import EMsg
 from steam.core import crypto
-from steam.core.connection import TCPConnection
+from steam.core.connection import TCPConnection, WebSocketConnection
 from steam.core.msg import Msg, MsgProto
 from eventemitter import EventEmitter
 from steam.utils import ip4_from_int
@@ -59,6 +59,7 @@ class CMClient(EventEmitter):
 
     PROTOCOL_TCP = 0                        #: TCP protocol enum
     PROTOCOL_UDP = 1                        #: UDP protocol enum
+    PROTOCOL_WEBSOCKET = 2
     verbose_debug = False                   #: print message connects in debug
 
     auto_discovery = True                   #: enables automatic CM discovery
@@ -82,11 +83,20 @@ class CMClient(EventEmitter):
 
     def __init__(self, protocol=PROTOCOL_TCP):
         self.cm_servers = CMServerList()
+        self.protocol   = protocol
 
+        if protocol == CMClient.PROTOCOL_UDP:
+            raise ValueError('UDP is deprecated')
+            
         if protocol == CMClient.PROTOCOL_TCP:
+            self._LOG.warning("PROTOCOL_TCP is being deprecated")
             self.connection = TCPConnection()
+            
+        elif protocol == CMClient.PROTOCOL_WEBSOCKET:
+            self.connection = WebSocketConnection()
+            
         else:
-            raise ValueError("Only TCP is supported")
+            raise ValueError("Unsupported protocol")
 
         self.on(EMsg.ChannelEncryptRequest, self.__handle_encrypt_request),
         self.on(EMsg.Multi, self.__handle_multi),
@@ -132,8 +142,12 @@ class CMClient(EventEmitter):
                 self._connecting = False
                 return False
 
-            if not self.cm_servers.bootstrap_from_webapi():
-                self.cm_servers.bootstrap_from_dns()
+            if self.protocol == CMClient.PROTOCOL_TCP:
+                if not self.cm_servers.bootstrap_from_webapi(protocol = self.protocol):
+                    self.cm_servers.bootstrap_from_dns()
+                    
+            elif self.protocol == CMClient.PROTOCOL_WEBSOCKET:
+                self.cm_servers.bootstrap_from_webapi(protocol = self.protocol)
 
         for i, server_addr in enumerate(cycle(self.cm_servers), start=next(i)-1):
             if retry and i >= retry:
@@ -154,6 +168,11 @@ class CMClient(EventEmitter):
         self.current_server_addr = server_addr
         self.connected = True
         self.emit(self.EVENT_CONNECTED)
+        
+        if self.protocol == CMClient.PROTOCOL_WEBSOCKET:
+            self.channel_secured = True
+            self.emit(self.EVENT_CHANNEL_SECURED)
+        
         self._recv_loop = gevent.spawn(self._recv_messages)
         self._connecting = False
         return True
@@ -472,7 +491,7 @@ class CMServerList(object):
             self._LOG.error("DNS boostrap: cm0.steampowered.com resolved no A records")
             return False
 
-    def bootstrap_from_webapi(self, cell_id=0):
+    def bootstrap_from_webapi(self, cell_id=0, protocol=CMClient.PROTOCOL_TCP):
         """
         Fetches CM server list from WebAPI and replaces the current one
 
@@ -481,24 +500,43 @@ class CMServerList(object):
         :return: booststrap success
         :rtype: :class:`bool`
         """
-        self._LOG.debug("Attempting bootstrap via WebAPI")
+        self._LOG.debug("Attempting bootstrap via WebAPI for protocol %d" % protocol)
 
         from steam import webapi
-        try:
-            resp = webapi.get('ISteamDirectory', 'GetCMList', 1, params={'cellid': cell_id,
-                                                                         'http_timeout': 3})
-        except Exception as exp:
-            self._LOG.error("WebAPI boostrap failed: %s" % str(exp))
-            return False
-
-        result = EResult(resp['response']['result'])
-
-        if result != EResult.OK:
-            self._LOG.error("GetCMList failed with %s" % repr(result))
-            return False
-
-        serverlist = resp['response']['serverlist']
-        self._LOG.debug("Received %d servers from WebAPI" % len(serverlist))
+        
+        if protocol == CMClient.PROTOCOL_TCP:
+            try:
+                resp = webapi.get('ISteamDirectory', 'GetCMList', 1, params={'cellid': cell_id,
+                                                                             'http_timeout': 3})
+            except Exception as exp:
+                self._LOG.error("WebAPI boostrap failed: %s" % str(exp))
+                return False
+    
+            result = EResult(resp['response']['result'])
+    
+            if result != EResult.OK:
+                self._LOG.error("GetCMList failed with %s" % repr(result))
+                return False
+    
+            serverlist = resp['response']['serverlist']
+            self._LOG.debug("Received %d servers from WebAPI" % len(serverlist))
+            
+        elif protocol == CMClient.PROTOCOL_WEBSOCKET:
+            try:
+                resp = webapi.get('ISteamDirectory', 'GetCMListForConnect', 1, params={'cmtype': 'websockets', 'http_timeout': 3})
+            except Exception as exp:
+                self._LOG.error("WebAPI boostrap failed: %s" % str(exp))
+                return False
+    
+            if not resp['response']['success']:
+                self._LOG.error("GetCMListForConnect failed with %s" % repr(resp))
+                return False
+    
+            serverlist = [server['endpoint'] for server in resp['response']['serverlist']]
+            self._LOG.debug("Received %d servers from WebAPI" % len(serverlist))
+            
+        else:
+            raise ValueError('Unsupported protocol for CMServerList')
 
         def str_to_tuple(serveraddr):
             ip, port = serveraddr.split(':')
