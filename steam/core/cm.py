@@ -352,26 +352,64 @@ class CMClient(EventEmitter):
     def __handle_multi(self, msg):
         self._LOG.debug("Multi: Unpacking")
 
+        # Extract body
+        body_bytes = msg.body.message_body
+
+        # If server indicated uncompressed size, it's definitely gzip-compressed
         if msg.body.size_unzipped:
             self._LOG.debug("Multi: Decompressing payload (%d -> %s)" % (
-                len(msg.body.message_body),
-                msg.body.size_unzipped,
-                ))
-
-            with GzipFile(fileobj=BytesIO(msg.body.message_body)) as f:
-                data = f.read()
+                len(body_bytes), msg.body.size_unzipped,
+            ))
+            try:
+                with GzipFile(fileobj=BytesIO(body_bytes)) as f:
+                    data = f.read()
+            except Exception as exp:
+                self._LOG.exception(exp)
+                gevent.spawn(self.disconnect)
+                return
 
             if len(data) != msg.body.size_unzipped:
                 self._LOG.fatal("Unzipped size mismatch")
                 gevent.spawn(self.disconnect)
                 return
         else:
-            data = msg.body.message_body
+            # Some CMs occasionally send gzip-compressed data without size_unzipped set.
+            # Detect gzip magic and transparently decompress.
+            if body_bytes.startswith(b"\x1f\x8b\x08"):
+                self._LOG.debug("Multi: Detected gzip without size hint; decompressing (%d bytes)" % len(body_bytes))
+                try:
+                    with GzipFile(fileobj=BytesIO(body_bytes)) as f:
+                        data = f.read()
+                except Exception as exp:
+                    self._LOG.exception(exp)
+                    gevent.spawn(self.disconnect)
+                    return
+            else:
+                data = body_bytes
 
-        while len(data) > 0:
-            size, = struct.unpack_from("<I", data)
-            self._parse_message(data[4:4+size])
-            data = data[4+size:]
+        # Split concatenated messages (each prefixed with 4-byte little-endian size)
+        view = memoryview(data)
+        offset = 0
+        total_len = len(view)
+
+        while offset + 4 <= total_len:
+            try:
+                (chunk_size,) = struct.unpack_from("<I", view, offset)
+            except Exception as exp:
+                self._LOG.exception(exp)
+                break
+
+            next_offset = offset + 4 + chunk_size
+            if next_offset > total_len:
+                self._LOG.error("Multi: Truncated chunk (size=%d, available=%d)" % (chunk_size, total_len - (offset + 4)))
+                break
+
+            self._parse_message(view[offset + 4: next_offset])
+            offset = next_offset
+
+        if offset != total_len:
+            self._LOG.debug("Multi: %d trailing bytes after parsing chunks" % (total_len - offset))
+
 
     def __heartbeat(self, interval):
         message = MsgProto(EMsg.ClientHeartBeat)
