@@ -30,6 +30,7 @@ install_extras = {
         'protobuf~=3.0; python_version >= "3"',
         'protobuf<3.18.0; python_version < "3"',
         'gevent-eventemitter~=2.1',
+        'wsproto~=1.2.0',
     ],
 }
 
@@ -38,9 +39,9 @@ setup(
     version=__version__,
     description='Module for interacting with various Steam features',
     long_description=long_description,
-    url='https://github.com/ValvePython/steam',
-    author="Rossen Georgiev",
-    author_email='rossen@rgp.io',
+    url='https://github.com/CFTools-Software-GmbH/ValvePython-steam',
+    author="Rossen Georgiev, CFTools Software GmbH",
+    author_email='info@cftools.software',
     license='MIT',
     classifiers=[
         'Development Status :: 5 - Production/Stable',
