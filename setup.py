@@ -35,7 +35,7 @@ install_extras = {
 }
 
 setup(
-    name='steam',
+    name='steam-rv',
     version=__version__,
     description='Module for interacting with various Steam features',
     long_description=long_description,
