@@ -97,6 +97,8 @@ class CMClient(EventEmitter):
             
         else:
             raise ValueError("Unsupported protocol")
+            
+        self._multibuf = b''
 
         self.on(EMsg.ChannelEncryptRequest, self.__handle_encrypt_request),
         self.on(EMsg.Multi, self.__handle_multi),
@@ -263,8 +265,20 @@ class CMClient(EventEmitter):
 
     def _parse_message(self, message):
         emsg_id, = struct.unpack_from("<I", message)
-        emsg = EMsg(clear_proto_bit(emsg_id))
-
+        
+        try:
+            emsg = EMsg(clear_proto_bit(emsg_id))
+        
+        except Exception as e:
+            if len(self._multibuf):
+                self._multibuf += message
+                if not self._multibuf.endswith(b'\x00\x00'):
+                    return
+                
+                message = self._multibuf
+                self._multibuf = b''
+                return self._parse_message(message)
+                
         if not self.connected and emsg != EMsg.ClientLogOnResponse:
             self._LOG.debug("Dropped unexpected message: %s (is_proto: %s)",
                             repr(emsg),
@@ -293,7 +307,12 @@ class CMClient(EventEmitter):
                 return
 
         if self.count_listeners(emsg) or self.verbose_debug:
-            msg.parse()
+            try:
+                msg.parse()
+            
+            except Exception as e:
+                self._multibuf = message
+                return
 
         if self.verbose_debug:
             self._LOG.debug("Incoming: %s\n%s" % (repr(msg), str(msg)))
@@ -391,7 +410,6 @@ class CMClient(EventEmitter):
         view = memoryview(data)
         offset = 0
         total_len = len(view)
-
         while offset + 4 <= total_len:
             try:
                 (chunk_size,) = struct.unpack_from("<I", view, offset)
