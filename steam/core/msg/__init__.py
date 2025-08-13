@@ -20,6 +20,7 @@ from steam.protobufs import steammessages_clientserver_ucm_pb2
 from steam.protobufs import steammessages_clientserver_uds_pb2
 from steam.protobufs import steammessages_clientserver_ufs_pb2
 from steam.protobufs import steammessages_clientserver_userstats_pb2
+from steam.protobufs import steammessages_clientserver_video_pb2
 
 
 cmsg_lookup_predefined = {
@@ -52,6 +53,7 @@ for proto_module in [
                     steammessages_clientserver_uds_pb2,
                     steammessages_clientserver_ufs_pb2,
                     steammessages_clientserver_userstats_pb2,
+                    steammessages_clientserver_video_pb2,
                     ]:
     cmsg_list = proto_module.__dict__
     cmsg_list = fnmatch.filter(cmsg_list, 'CMsg*')
@@ -198,7 +200,6 @@ class MsgProto(object):
             if proto:
                 self.body = proto()
                 if self.payload:
-                    print(self.payload)
                     self.body.ParseFromString(self.payload)
                     self.payload = None
             else:
