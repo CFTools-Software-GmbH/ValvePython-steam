@@ -1,4 +1,4 @@
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 __author__ = "Rossen Georgiev, CFTools Software GmbH"
 
-version_info = (1, 5, 0)
+version_info = (1, 5, 1)
