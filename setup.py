@@ -22,6 +22,7 @@ install_requires = [
     'cachetools>=3.0.0',
     "win-inet-pton; python_version == '2.7' and sys_platform == 'win32'",
     "enum34==1.1.2; python_version < '3.4'",
+    'zstd~=1.5.7.2'
 ]
 
 install_extras = {
