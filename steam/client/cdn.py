@@ -119,6 +119,8 @@ try:
     import lzma
 except ImportError:
     from backports import lzma
+    
+import zstd # TODO: Implement Python 3.13 zstd from standard lib
 
 def decrypt_manifest_gid_2(encrypted_gid, password):
     """Decrypt manifest gid v2 bytes
@@ -621,6 +623,30 @@ class CDNClient(object):
                 data = vzdec.decompress(data[12:-9])[:decompressed_size]
                 if crc32(data) != checksum:
                     raise SteamError("VZ: CRC32 checksum doesn't match for decompressed data")
+                    
+            elif data[:4] == b'VSZa':
+                if len(data) < 4 + 4 + 15: # magic + crc + footer
+                    raise SteamError("VSZa: file too small")
+                    
+                crc_head   = struct.unpack_from('<I', data, 4)[0] # bytes 4-7
+                crc_footer = struct.unpack_from('<I', data, len(data)-15)[0]
+                size_raw   = struct.unpack_from('<I', data, len(data)-11)[0]
+            
+                if crc_head != crc_footer:
+                    raise SteamError("VSZa: CRC32 mismatch (header vs footer)")
+                if data[-3:] != b'zsv':
+                    raise SteamError(f"VSZa: invalid footer marker: {data[-3:]}")
+            
+                compressed = data[8:-15] # strip meta
+                raw        = zstd.decompress(compressed)
+            
+                if len(raw) != size_raw:
+                    raise SteamError(f"VSZa: size mismatch (expected {size_raw}, got {len(raw)})")
+                if (crc32(raw) & 0xFFFFFFFF) != crc_footer:
+                    raise SteamError("VSZa: CRC32 checksum doesn't match for decompressed data")
+            
+                data = raw
+            
             else:
                 with ZipFile(BytesIO(data)) as zf:
                     data = zf.read(zf.filelist[0])
