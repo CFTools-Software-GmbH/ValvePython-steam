@@ -861,7 +861,10 @@ class CDNClient(object):
                     manifest_gid = depot_info.get('manifests', {}).get('public')
             else:
                 manifest_gid = depot_info.get('manifests', {}).get(branch)
-
+                
+            if isinstance(manifest_gid, dict):
+                manifest_gid = manifest_gid['gid']
+                
             if manifest_gid is not None:
                 tasks.append(
                     self.gpool.spawn(
