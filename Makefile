@@ -56,10 +56,10 @@ docs: .FORCE
 	$(MAKE) -C docs html
 
 clean:
-	rm -rf dist steam.egg-info steam/*.pyc
+	rm -rf dist steam.egg-info steam_rv.egg-info steam/*.pyc
 
 dist: clean
-	python setup.py sdist
+	python3 setup.py sdist
 
 upload: dist
 	twine upload -r pypi dist/*
