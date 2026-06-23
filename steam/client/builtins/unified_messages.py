@@ -34,13 +34,17 @@ class UnifiedMessages(object):
     def __init__(self, *args, **kwargs):
         super(UnifiedMessages, self).__init__(*args, **kwargs)
 
-    def send_um(self, method_name, params=None):
+    def send_um(self, method_name, params=None, authed=True):
         """Send service method request
 
         :param method_name: method name (e.g. ``Player.GetGameBadgeLevels#1``)
         :type  method_name: :class:`str`
         :param params: message parameters
         :type  params: :class:`dict`
+        :param authed: when :class:`False` the request is sent as a non-authed
+            service method, which is required for calls made before logon
+            (e.g. the ``Authentication`` service during the new login flow)
+        :type  authed: :class:`bool`
         :return: ``job_id`` identifier
         :rtype: :class:`str`
 
@@ -51,7 +55,8 @@ class UnifiedMessages(object):
         if proto is None:
             raise ValueError("Failed to find method named: %s" % method_name)
 
-        message = MsgProto(EMsg.ServiceMethodCallFromClient)
+        emsg = EMsg.ServiceMethodCallFromClient if authed else EMsg.ServiceMethodCallFromClientNonAuthed
+        message = MsgProto(emsg)
         message.header.target_job_name = method_name
         message.body = proto()
 
@@ -60,7 +65,7 @@ class UnifiedMessages(object):
 
         return self.send_job(message)
 
-    def send_um_and_wait(self, method_name, params=None, timeout=10, raises=False):
+    def send_um_and_wait(self, method_name, params=None, timeout=10, raises=False, authed=True):
         """Send service method request and wait for response
 
         :param method_name: method name (e.g. ``Player.GetGameBadgeLevels#1``)
@@ -71,9 +76,12 @@ class UnifiedMessages(object):
         :type  timeout: :class:`int`
         :param raises: (optional) On timeout if :class:`False` return :class:`None`, else raise :class:`gevent.Timeout`
         :type  raises: :class:`bool`
+        :param authed: when :class:`False` the request is sent as a non-authed
+            service method (required for pre-logon calls)
+        :type  authed: :class:`bool`
         :return: response message
         :rtype: proto message instance
         :raises: :class:`gevent.Timeout`
         """
-        job_id = self.send_um(method_name, params)
+        job_id = self.send_um(method_name, params, authed=authed)
         return self.wait_msg(job_id, timeout, raises=raises)

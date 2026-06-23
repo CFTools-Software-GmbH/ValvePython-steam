@@ -81,9 +81,10 @@ class CMClient(EventEmitter):
     _heartbeat_loop = None
     _LOG = logging.getLogger("CMClient")
 
-    def __init__(self, protocol=PROTOCOL_TCP):
-        self.cm_servers = CMServerList()
+    def __init__(self, protocol=PROTOCOL_TCP, china=False):
+        self.cm_servers = CMServerList(china=china)
         self.protocol   = protocol
+        self.china = china  #: use Steam China servers
 
         if protocol == CMClient.PROTOCOL_UDP:
             raise ValueError('UDP is deprecated')
@@ -506,9 +507,13 @@ class CMServerList(object):
     cell_id = 0            #: cell id of the server list
     bad_timestamp = 300    #: how long bad mark lasts in seconds
 
-    def __init__(self):
+    CM_DOMAIN_GLOBAL = 'cm0.steampowered.com'
+    CM_DOMAIN_CHINA = 'cm0.steamchina.com'
+
+    def __init__(self, china=False):
         self._LOG = logging.getLogger("CMServerList")
         self.list = defaultdict(dict)
+        self.china = china  #: use Steam China servers
 
     def __len__(self):
         return len(self.list)
@@ -524,12 +529,13 @@ class CMServerList(object):
 
     def bootstrap_from_dns(self):
         """
-        Fetches CM server list from WebAPI and replaces the current one
+        Fetches CM server list via DNS and replaces the current one
         """
-        self._LOG.debug("Attempting bootstrap via DNS")
+        cm_domain = self.CM_DOMAIN_CHINA if self.china else self.CM_DOMAIN_GLOBAL
+        self._LOG.debug("Attempting bootstrap via DNS using %s" % cm_domain)
 
         try:
-            answer = socket.getaddrinfo("cm0.steampowered.com",
+            answer = socket.getaddrinfo(cm_domain,
                                         27017,
                                         socket.AF_INET,
                                         proto=socket.IPPROTO_TCP)
@@ -544,7 +550,7 @@ class CMServerList(object):
             self.merge_list(servers)
             return True
         else:
-            self._LOG.error("DNS boostrap: cm0.steampowered.com resolved no A records")
+            self._LOG.error("DNS boostrap: %s resolved no A records" % cm_domain)
             return False
 
     def bootstrap_from_webapi(self, cell_id=0, protocol=CMClient.PROTOCOL_TCP):
@@ -556,14 +562,17 @@ class CMServerList(object):
         :return: booststrap success
         :rtype: :class:`bool`
         """
-        self._LOG.debug("Attempting bootstrap via WebAPI for protocol %d" % protocol)
+        self._LOG.debug("Attempting bootstrap via WebAPI for protocol %d (china=%s)" % (protocol, self.china))
 
         from steam import webapi
+        from steam.webapi import APIHost
+
+        apihost = APIHost.China if self.china else APIHost.Public
         
         if protocol == CMClient.PROTOCOL_TCP:
             try:
-                resp = webapi.get('ISteamDirectory', 'GetCMList', 1, params={'cellid': cell_id,
-                                                                             'http_timeout': 3})
+                resp = webapi.get('ISteamDirectory', 'GetCMList', 1, apihost=apihost,
+                                  params={'cellid': cell_id, 'http_timeout': 3})
             except Exception as exp:
                 self._LOG.error("WebAPI boostrap failed: %s" % str(exp))
                 return False
@@ -579,7 +588,8 @@ class CMServerList(object):
             
         elif protocol == CMClient.PROTOCOL_WEBSOCKET:
             try:
-                resp = webapi.get('ISteamDirectory', 'GetCMListForConnect', 1, params={'cmtype': 'websockets', 'http_timeout': 3})
+                resp = webapi.get('ISteamDirectory', 'GetCMListForConnect', 1, apihost=apihost,
+                                  params={'cmtype': 'websockets', 'http_timeout': 3})
             except Exception as exp:
                 self._LOG.error("WebAPI boostrap failed: %s" % str(exp))
                 return False

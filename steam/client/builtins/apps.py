@@ -173,6 +173,27 @@ class Apps(object):
 
         return data
 
+    def enable_item_announcements(self):
+        print('1')
+        msg = MsgProto(EMsg.ClientRequestItemAnnouncements)
+        msg.body.Clear()
+        response =  self.send_message_and_wait(msg, EMsg.ClientRequestItemAnnouncements, timeout = False)
+        print('2')
+        print(response)
+        return response
+
+    def ucm_get_changes_since(self, app_id, start_index=0, start_time=0, desired_revision=0):
+        """ WIP """
+        return self.send_job_and_wait(MsgProto(EMsg.ClientUCMEnumerateUserSubscribedFilesWithUpdates),
+                                      {
+                                       'app_id': app_id,
+                                       'start_index': start_index,
+                                       'start_time': start_time,
+                                       'desired_revision': desired_revision
+                                      },
+                                      timeout=10
+                                      )
+
     def get_changes_since(self, change_number, app_changes=True, package_changes=False):
         """Get changes since a change number
 
@@ -239,26 +260,29 @@ class Apps(object):
                                       timeout=10
                                       )
 
-    def get_cdn_auth_token(self, depot_id, hostname):
+    def get_cdn_auth_token(self, app_id, depot_id, hostname):
         """Get CDN authentication token
 
         .. note::
             This token is no longer needed for access to CDN files
 
+        :param app_id: app id
+        :type  app_id: :class:`int`
         :param depot_id: depot id
         :type  depot_id: :class:`int`
         :param hostname: cdn hostname
         :type  hostname: :class:`str`
-        :return: `CMsgClientGetCDNAuthTokenResponse <https://github.com/ValvePython/steam/blob/39627fe883feeed2206016bacd92cf0e4580ead6/protobufs/steammessages_clientserver_2.proto#L585-L589>`_
+        :return: `CContentServerDirectory_GetCDNAuthToken_Response <https://github.com/ValvePython/steam/blob/master/protobufs/steammessages_contentsystem.proto>`_
         :rtype: proto message
         """
-        return self.send_job_and_wait(MsgProto(EMsg.ClientGetCDNAuthToken),
-                                      {
-                                       'depot_id': depot_id,
-                                       'host_name': hostname,
-                                      },
-                                      timeout=10
-                                      )
+        return self.send_um_and_wait('ContentServerDirectory.GetCDNAuthToken#1',
+                                     {
+                                      'app_id': app_id,
+                                      'depot_id': depot_id,
+                                      'host_name': hostname,
+                                     },
+                                     timeout=10
+                                     )
 
     def get_access_tokens(self, app_ids=[], package_ids=[]):
         """Get access tokens

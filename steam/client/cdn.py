@@ -101,6 +101,7 @@ from binascii import crc32, unhexlify
 from datetime import datetime
 import logging
 import struct
+import time
 
 import vdf
 from gevent.pool import Pool as GPool
@@ -474,6 +475,7 @@ class CDNClient(object):
         self.beta_passwords = {}         #: beta branch decryption keys
         self.licensed_app_ids = set()    #: app_ids that the SteamClient instance has access to
         self.licensed_depot_ids = set()  #: depot_ids that the SteamClient instance has access to
+        self._cdn_auth_tokens = {}       #: CDN auth tokens cache, key: (depot_id, hostname), value: (token, expiration)
 
         if not self.servers:
             self.fetch_content_servers()
@@ -554,18 +556,62 @@ class CDNClient(object):
 
         return self.depot_keys[depot_id]
 
-    def cdn_cmd(self, command, args):
+    def get_cdn_auth_token(self, app_id, depot_id, hostname):
+        """Get CDN authentication token for a specific server
+
+        Some CDN servers (particularly China CDN) require authentication tokens
+        for content access. This method retrieves and caches those tokens.
+
+        :param app_id: app id
+        :type  app_id: int
+        :param depot_id: depot id
+        :type  depot_id: int
+        :param hostname: CDN server hostname
+        :type  hostname: str
+        :return: CDN auth token string, or empty string if not available
+        :rtype: str
+        """
+        cache_key = (depot_id, hostname)
+
+        # Check cache first
+        if cache_key in self._cdn_auth_tokens:
+            token, expiration = self._cdn_auth_tokens[cache_key]
+            # Check if token is still valid (with 60 second buffer)
+            if expiration > time.time() + 60:
+                return token
+
+        # Request new token from Steam
+        self._LOG.debug("Requesting CDN auth token for depot %s, host %s", depot_id, hostname)
+        resp = self.steam.get_cdn_auth_token(app_id, depot_id, hostname)
+
+        if resp and resp.body.token:
+            token = resp.body.token
+            expiration = resp.body.expiration_time
+            self._cdn_auth_tokens[cache_key] = (token, expiration)
+            self._LOG.debug("Got CDN auth token for %s (expires %s)", hostname, expiration)
+            return token
+
+        self._LOG.debug("No CDN auth token returned for %s", hostname)
+        return ''
+
+    def cdn_cmd(self, command, args, app_id=None, depot_id=None):
         """Run CDN command request
 
         :param command: command name
         :type  command: str
         :param args: args
         :type  args: str
+        :param app_id: (optional) app id for CDN auth token request
+        :type  app_id: int
+        :param depot_id: (optional) depot id for CDN auth token request
+        :type  depot_id: int
         :returns: requests response
         :rtype: :class:`requests.Response`
         :raises SteamError: on error
         """
         server = self.get_content_server()
+        cdn_auth_token = ''
+        tried_token = False
 
         while True:
             url = "%s://%s:%s/%s/%s" % (
@@ -576,6 +622,10 @@ class CDNClient(object):
                 args,
                 )
 
+            # Append CDN auth token as query string if we have one
+            if cdn_auth_token:
+                url += "?" + cdn_auth_token
+
             try:
                 resp = self.web.get(url, timeout=10)
             except Exception as exp:
@@ -583,11 +633,25 @@ class CDNClient(object):
             else:
                 if resp.ok:
                     return resp
+                elif resp.status_code == 403 and not tried_token and app_id is not None and depot_id is not None:
+                    # Got 403 Forbidden - try requesting CDN auth token
+                    self._LOG.debug("Got 403 Forbidden, requesting CDN auth token for %s", server.host)
+                    cdn_auth_token = self.get_cdn_auth_token(app_id, depot_id, server.host)
+                    tried_token = True
+                    if cdn_auth_token:
+                        self._LOG.debug("Retrying with CDN auth token")
+                        continue  # Retry with token
+                    else:
+                        self._LOG.debug("No CDN auth token available, raising error")
+                        raise SteamError("HTTP Error %s (CDN auth token required but not available)" % resp.status_code)
                 elif 400 <= resp.status_code < 500:
                     self._LOG.debug("Got HTTP %s", resp.status_code)
                     raise SteamError("HTTP Error %s" % resp.status_code)
                 self.steam.sleep(0.5)
 
+            # Reset token state when rotating servers
+            cdn_auth_token = ''
+            tried_token = False
             server = self.get_content_server(rotate=True)
 
     def get_chunk(self, app_id, depot_id, chunk_id):
@@ -604,7 +668,7 @@ class CDNClient(object):
         :raises SteamError: error message
         """
         if (depot_id, chunk_id) not in self._chunk_cache:
-            resp = self.cdn_cmd('depot', '%s/chunk/%s' % (depot_id, chunk_id))
+            resp = self.cdn_cmd('depot', '%s/chunk/%s' % (depot_id, chunk_id), app_id=app_id, depot_id=depot_id)
 
             data = symmetric_decrypt(resp.content, self.get_depot_key(app_id, depot_id))
 
@@ -714,9 +778,11 @@ class CDNClient(object):
         """
         if (app_id, depot_id, manifest_gid) not in self.manifests:
             if manifest_request_code:
-                resp = self.cdn_cmd('depot', '%s/manifest/%s/5/%s' % (depot_id, manifest_gid, manifest_request_code))
+                resp = self.cdn_cmd('depot', '%s/manifest/%s/5/%s' % (depot_id, manifest_gid, manifest_request_code),
+                                    app_id=app_id, depot_id=depot_id)
             else:
-                resp = self.cdn_cmd('depot', '%s/manifest/%s/5' % (depot_id, manifest_gid))
+                resp = self.cdn_cmd('depot', '%s/manifest/%s/5' % (depot_id, manifest_gid),
+                                    app_id=app_id, depot_id=depot_id)
 
             if resp.ok:
                 manifest = self.DepotManifestClass(self, app_id, resp.content)

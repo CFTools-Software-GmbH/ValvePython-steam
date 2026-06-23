@@ -43,6 +43,8 @@ class APIHost(object):
     .. note::
         Key is required for every request. If not supplied you will get HTTP 403.
     """
+    China = 'api.steamchina.com'
+    """Steam China (Perfect World) API host"""
 
 DEFAULT_PARAMS = {
     # api parameters

@@ -15,9 +15,11 @@ Implementation of Steam client based on ``gevent``
 """
 import os
 import json
+import socket
 from random import random
 from time import time
 from io import open
+from base64 import b64encode
 from getpass import getpass
 import logging
 import six
@@ -25,9 +27,10 @@ import six
 from eventemitter import EventEmitter
 from steam.enums import EResult, EOSType, EPersonaState
 from steam.enums.emsg import EMsg
+from steam.enums.proto import EAuthTokenPlatformType, ESessionPersistence, EAuthSessionGuardType
 from steam.core.cm import CMClient
 from steam.core.msg import MsgProto
-from steam.core.crypto import sha1_hash
+from steam.core.crypto import sha1_hash, rsa_publickey, pkcs1v15_encrypt
 from steam.steamid import SteamID
 from steam.exceptions import SteamError
 from steam.client.builtins import BuiltinBase
@@ -56,11 +59,21 @@ class SteamClient(CMClient, BuiltinBase):
     current_jobid = 0
     credential_location = None         #: location for sentry
     username = None                    #: username when logged on
-    login_key = None                   #: can be used for subsequent logins (no 2FA code will be required)
+    login_key = None                   #: deprecated by Steam's new auth, retained for backwards compatibility
+    refresh_token = None               #: token from the new auth flow, used for subsequent logins (:meth:`relogin`)
     chat_mode = 2                      #: chat mode (0=old chat, 2=new chat)
 
-    def __init__(self, protocol = CMClient.PROTOCOL_TCP):
-        CMClient.__init__(self, protocol)
+    #: how long (seconds) to wait for the user to approve a device/email confirmation while polling
+    login_poll_timeout = 90
+
+    def __init__(self, protocol = CMClient.PROTOCOL_TCP, china=False):
+        """
+        :param protocol: protocol to use for connection (default: TCP, recommended: PROTOCOL_WEBSOCKET)
+        :type protocol: int
+        :param china: use Steam China (Perfect World) servers
+        :type china: bool
+        """
+        CMClient.__init__(self, protocol, china=china)
 
         # register listners
         self.on(self.EVENT_DISCONNECTED, self._handle_disconnect)
@@ -434,6 +447,52 @@ class SteamClient(CMClient, BuiltinBase):
 
         return False
 
+    def _get_guard_data_path(self, username):
+        if self.credential_location:
+            return os.path.join(self.credential_location, "%s_guard.txt" % username)
+        return None
+
+    def get_guard_data(self, username):
+        """Returns the stored machine guard token (``guard_data``) for the given username.
+
+        This token lets the new auth flow skip the email/2FA prompt on a remembered
+        device. Returns ``None`` if :attr:`credential_location` is unset or no token stored.
+
+        :param username: username
+        :type  username: str
+        :rtype: :class:`str`, :class:`None`
+        """
+        filepath = self._get_guard_data_path(username)
+
+        if filepath and os.path.isfile(filepath):
+            try:
+                with open(filepath, 'r') as f:
+                    return f.read().strip() or None
+            except IOError as e:
+                self._LOG.error("get_guard_data: %s" % str(e))
+
+        return None
+
+    def store_guard_data(self, username, guard_data):
+        """Persist the machine guard token (``guard_data``) returned by the auth flow.
+
+        :param username: username
+        :type  username: str
+        :param guard_data: token returned in ``PollAuthSessionStatus``
+        :type  guard_data: str
+        :rtype: :class:`bool`
+        """
+        filepath = self._get_guard_data_path(username)
+        if filepath:
+            try:
+                with open(filepath, 'w') as f:
+                    f.write(guard_data)
+                return True
+            except IOError as e:
+                self._LOG.error("store_guard_data: %s" % str(e))
+
+        return False
+
     def _pre_login(self):
         if self.logged_on:
             self._LOG.debug("Trying to login while logged on???")
@@ -457,13 +516,12 @@ class SteamClient(CMClient, BuiltinBase):
     @property
     def relogin_available(self):
         """``True`` when the client has the nessesary data for :meth:`relogin`"""
-        return bool(self.username) and bool(self.login_key)
+        return bool(self.username) and bool(self.refresh_token or self.login_key)
 
     def relogin(self):
-        """Login without needing credentials, essentially remember password.
-        The :attr:`login_key` is acquired after successful login and it will be
-        automatically acknowledged. Listen for the ``new_login_key`` event.
-        After that the client can relogin using this method.
+        """Login without needing credentials by reusing the previously acquired
+        :attr:`refresh_token` (Steam's new auth flow). The token is obtained after
+        a successful :meth:`login` and persists for the lifetime of the instance.
 
         .. note::
             Only works when :attr:`relogin_available` is ``True``.
@@ -477,9 +535,14 @@ class SteamClient(CMClient, BuiltinBase):
         :returns: login result
         :rtype: :class:`.EResult`
         """
-        if self.relogin_available:
-            return self.login(self.username, '', self.login_key)
-        return EResult.Fail
+        if not self.relogin_available:
+            return EResult.Fail
+
+        eresult = self._pre_login()
+        if eresult != EResult.OK:
+            return eresult
+
+        return self._send_logon(self.username, self.refresh_token or self.login_key)
 
     def login(self, username, password='', login_key=None, auth_code=None, two_factor_code=None, login_id=None):
         """Login as a specific user
@@ -528,13 +591,188 @@ class SteamClient(CMClient, BuiltinBase):
 
         self.username = username
 
+        # ``login_key`` is a legacy concept removed by Steam's new auth. If a caller
+        # still passes one (or a stored refresh token), use it directly as a token logon.
+        if login_key:
+            return self._send_logon(username, login_key, login_id=login_id)
+
+        # Steam no longer accepts a plaintext password inside ``ClientLogon`` (returns
+        # ``InvalidParam``). Exchange the credentials for a token via the Authentication
+        # service first, then log on with that token.
+        eresult, access_token, steam_id = self._login_via_credentials(
+            username,
+            password,
+            auth_code=auth_code,
+            two_factor_code=two_factor_code,
+        )
+
+        if eresult != EResult.OK:
+            return eresult
+
+        return self._send_logon(username, access_token, steam_id=steam_id, login_id=login_id)
+
+    def _login_via_credentials(self, username, password, auth_code=None, two_factor_code=None):
+        """Run the ``IAuthenticationService`` credential flow over the CM connection.
+
+        :return: tuple of ``(EResult, access_token, SteamID)``. ``access_token`` and
+            ``SteamID`` are ``None`` unless the result is :attr:`EResult.OK`.
+        :rtype: tuple
+        """
+        # A fresh CM connection drops pre-logon service method calls unless it has
+        # first received a ClientHello. Without this the CM closes the socket as soon
+        # as ``Authentication.*`` is sent (observed as an immediate disconnect).
+        self._send_client_hello()
+
+        rsa = self.send_um_and_wait('Authentication.GetPasswordRSAPublicKey#1', {
+            'account_name': username,
+        }, timeout=15, authed=False)
+
+        if rsa is None:
+            return EResult.Timeout, None, None
+        if rsa.header.eresult != EResult.OK:
+            self._LOG.debug("GetPasswordRSAPublicKey failed: %s" % repr(EResult(rsa.header.eresult)))
+            return EResult(rsa.header.eresult), None, None
+
+        pub_key = rsa_publickey(int(rsa.body.publickey_mod, 16), int(rsa.body.publickey_exp, 16))
+        encrypted_password = b64encode(pkcs1v15_encrypt(pub_key, password.encode('utf-8'))).decode('ascii')
+
+        device_friendly_name = '%s (steam-rv)' % socket.gethostname()
+
+        begin = self.send_um_and_wait('Authentication.BeginAuthSessionViaCredentials#1', {
+            'account_name': username,
+            'encrypted_password': encrypted_password,
+            'encryption_timestamp': rsa.body.timestamp,
+            'remember_login': True,
+            'persistence': ESessionPersistence.Persistent,
+            'website_id': 'Client',
+            'platform_type': EAuthTokenPlatformType.SteamClient,
+            'device_friendly_name': device_friendly_name,
+            'device_details': {
+                'device_friendly_name': device_friendly_name,
+                'platform_type': EAuthTokenPlatformType.SteamClient,
+                'os_type': EOSType.Windows10,
+            },
+            'guard_data': self.get_guard_data(username) or '',
+        }, timeout=15, authed=False)
+
+        if begin is None:
+            return EResult.Timeout, None, None
+        if begin.header.eresult != EResult.OK:
+            self._LOG.debug("BeginAuthSessionViaCredentials failed: %s" % repr(EResult(begin.header.eresult)))
+            return EResult(begin.header.eresult), None, None
+
+        client_id = begin.body.client_id
+        request_id = begin.body.request_id
+        steam_id = SteamID(begin.body.steamid)
+        interval = begin.body.interval or 5
+        allowed = [c.confirmation_type for c in begin.body.allowed_confirmations]
+
+        eresult = self._handle_login_confirmations(
+            client_id, steam_id, allowed, auth_code=auth_code, two_factor_code=two_factor_code
+        )
+        if eresult != EResult.OK:
+            return eresult, None, None
+
+        access_token = self._poll_auth_session(username, client_id, request_id, interval)
+        if access_token is None:
+            return EResult.Fail, None, None
+
+        return EResult.OK, access_token, steam_id
+
+    def _send_client_hello(self):
+        """Announce the client on a fresh connection so the CM will route pre-logon
+        service method calls (required by Steam's new authentication flow)."""
+        message = MsgProto(EMsg.ClientHello)
+        message.body.protocol_version = 65580
+        self.send(message)
+
+    def _handle_login_confirmations(self, client_id, steam_id, allowed, auth_code=None, two_factor_code=None):
+        """Submit a Steam Guard code when one is required and available.
+
+        Fires :attr:`EVENT_AUTH_CODE_REQUIRED` and returns the matching error result
+        when a code is required but was not supplied.
+        """
+        needs_2fa = EAuthSessionGuardType.DeviceCode in allowed
+        needs_email = EAuthSessionGuardType.EmailCode in allowed
+
+        if needs_2fa and two_factor_code:
+            return self._submit_steam_guard_code(client_id, steam_id, two_factor_code, EAuthSessionGuardType.DeviceCode)
+
+        if needs_email and auth_code:
+            return self._submit_steam_guard_code(client_id, steam_id, auth_code, EAuthSessionGuardType.EmailCode)
+
+        if needs_2fa:
+            self.emit(self.EVENT_AUTH_CODE_REQUIRED, True, bool(two_factor_code))
+            return EResult.AccountLoginDeniedNeedTwoFactor
+
+        if needs_email:
+            self.emit(self.EVENT_AUTH_CODE_REQUIRED, False, bool(auth_code))
+            return EResult.AccountLogonDenied
+
+        # ``DeviceConfirmation``/``EmailConfirmation`` need out-of-band approval; polling
+        # below will wait for the user to confirm, so nothing to submit here.
+        return EResult.OK
+
+    def _submit_steam_guard_code(self, client_id, steam_id, code, code_type):
+        resp = self.send_um_and_wait('Authentication.UpdateAuthSessionWithSteamGuardCode#1', {
+            'client_id': client_id,
+            'steamid': steam_id.as_64,
+            'code': code,
+            'code_type': code_type,
+        }, timeout=15, authed=False)
+
+        if resp is None:
+            return EResult.Timeout
+        if resp.header.eresult != EResult.OK:
+            self._LOG.debug("UpdateAuthSessionWithSteamGuardCode failed: %s" % repr(EResult(resp.header.eresult)))
+        return EResult(resp.header.eresult)
+
+    def _poll_auth_session(self, username, client_id, request_id, interval):
+        """Poll until a refresh token is issued. Returns the token, or ``None`` on failure/timeout."""
+        deadline = time() + self.login_poll_timeout
+
+        while True:
+            poll = self.send_um_and_wait('Authentication.PollAuthSessionStatus#1', {
+                'client_id': client_id,
+                'request_id': request_id,
+            }, timeout=15, authed=False)
+
+            if poll is None:
+                return None
+            if poll.header.eresult != EResult.OK:
+                self._LOG.debug("PollAuthSessionStatus failed: %s" % repr(EResult(poll.header.eresult)))
+                return None
+
+            if poll.body.new_client_id:
+                client_id = poll.body.new_client_id
+
+            if poll.body.refresh_token:
+                if poll.body.new_guard_data:
+                    self.store_guard_data(username, poll.body.new_guard_data)
+                # Steam uses the long-lived refresh token as the ClientLogon access_token
+                self.refresh_token = poll.body.refresh_token
+                return poll.body.refresh_token
+
+            if time() >= deadline:
+                self._LOG.debug("PollAuthSessionStatus timed out waiting for confirmation")
+                return None
+
+            self.sleep(interval)
+
+    def _send_logon(self, username, access_token, steam_id=None, login_id=None):
+        """Send ``ClientLogon`` using a token acquired from the Authentication service.
+
+        :attr:`steam_id` is populated by :class:`.CMClient` from the logon response header.
+        """
+        self.username = username
+
         message = MsgProto(EMsg.ClientLogon)
-        message.header.steamid = SteamID(type='Individual', universe='Public')
+        message.header.steamid = SteamID(steam_id) if steam_id is not None \
+            else SteamID(type='Individual', universe='Public')
         message.body.protocol_version = 65580
         message.body.client_package_version = 1561159470
         message.body.client_os_type = EOSType.Windows10
         message.body.client_language = "english"
-        message.body.should_remember_password = True
         message.body.supports_rate_limit_response = True
         message.body.chat_mode = self.chat_mode
 
@@ -544,23 +782,7 @@ class SteamClient(CMClient, BuiltinBase):
             message.body.obfuscated_private_ip.v4 = login_id
 
         message.body.account_name = username
-
-        if login_key:
-            message.body.login_key = login_key
-        else:
-            message.body.password = password
-
-        sentry = self.get_sentry(username)
-        if sentry is None:
-            message.body.eresult_sentryfile = EResult.FileNotFound
-        else:
-            message.body.eresult_sentryfile = EResult.OK
-            message.body.sha_sentryfile = sha1_hash(sentry)
-
-        if auth_code:
-            message.body.auth_code = auth_code
-        if two_factor_code:
-            message.body.two_factor_code = two_factor_code
+        message.body.access_token = access_token
 
         self.send(message)
 

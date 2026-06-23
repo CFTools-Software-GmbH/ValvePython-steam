@@ -1960,6 +1960,8 @@ class EMsg(SteamIntEnum):
     ClientVoiceCallPreAuthorizeResponse = 9801
     ClientServerTimestampRequest = 9802
     ClientServerTimestampResponse = 9803
+    ServiceMethodCallFromClientNonAuthed = 9804  #: unified service method sent before logon (new auth flow)
+    ClientHello = 9805  #: sent on a fresh connection before pre-logon service methods are accepted
 
     ClientLANP2PRequestChunk = 9900
     ClientLANP2PBase = 9900
